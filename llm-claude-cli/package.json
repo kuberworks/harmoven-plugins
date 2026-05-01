@@ -1,6 +1,7 @@
 {
   "name": "@harmoven/plugin-claude-cli",
   "version": "1.0.0",
+  "type": "module",
   "description": "Claude CLI subscription provider for Harmoven — system plugin. Routes LLM calls through a Claude Pro/Max subscription via the Claude CLI OAuth token.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -15,7 +16,9 @@
     "prepare": "npm run build",
     "build": "tsc && tsc -p tsconfig.bootstrap.json",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.bootstrap.json --noEmit",
-    "build:plugin": "npx esbuild src/index.ts --bundle --platform=node --format=cjs --target=node22 --external:node:* --external:next --outfile=plugin.cjs --log-level=info"
+    "build:plugin": "npx esbuild src/index.ts --bundle --platform=node --format=cjs --target=node22 --external:node:* --external:next --outfile=plugin.cjs --log-level=info",
+    "pack": "node scripts/pack-hpkg.js",
+    "release": "npm run build:plugin && node scripts/pack-hpkg.js"
   },
   "peerDependencies": {
     "@prisma/client": ">=7.0.0"
@@ -26,6 +29,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/semver": "^7.5.8",
+    "jszip": "^3.10.1",
     "typescript": "^5.8.0"
   },
   "files": [
