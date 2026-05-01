@@ -1,0 +1,55 @@
+// prisma/schema.prisma
+// Claude CLI plugin — Prisma model fragment.
+//
+// INSTALLATION: append these models to harmoven's prisma/schema.prisma, then:
+//   npx prisma migrate dev --name add-claude-cli-plugin
+//   npx prisma generate
+//
+// These models are isolated from harmoven's core domain.
+// They are only used by the claude-cli system plugin.
+//
+// NOTE: If you installed Harmoven before this plugin existed, these tables are
+// already present (they were originally built into the core schema).
+// In that case, skip the migration — run only `npx prisma generate`.
+
+// ─── Claude CLI Plugin models ──────────────────────────────────────────────
+
+/// Single-row snapshot of rate-limit state — upserted on exhaustion and restart.
+model ClaudeCliRateLimitSnapshot {
+  id                              Int       @id @default(1)
+
+  session_exhausted_until         DateTime?
+  weekly_non_opus_exhausted_until DateTime?
+  weekly_opus_exhausted_until     DateTime?
+
+  session_call_count              Int       @default(0)
+  weekly_non_opus_call_count      Int       @default(0)
+  weekly_opus_call_count          Int       @default(0)
+
+  session_window_start            DateTime?
+  weekly_window_start             DateTime?
+
+  session_tokens_in               Int       @default(0)
+  session_tokens_out              Int       @default(0)
+  weekly_non_opus_tokens_in       Int       @default(0)
+  weekly_non_opus_tokens_out      Int       @default(0)
+  weekly_opus_tokens_in           Int       @default(0)
+  weekly_opus_tokens_out          Int       @default(0)
+
+  plugin_status                   String    @default("not_configured")
+  dead_reason                     String?
+
+  weekly_overage_usd              Float     @default(0)
+
+  updated_at                      DateTime  @updatedAt
+}
+
+/// Distributed semaphore slots for multi-instance deployments.
+/// Requires CLAUDE_CLI_DISTRIBUTED_MODE=true.
+model ClaudeCliSemaphoreSlot {
+  id      Int      @id
+  held_by String?
+  held_at DateTime?
+
+  @@index([held_by])
+}
