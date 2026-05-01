@@ -230,16 +230,34 @@ export async function pingAuth(config: CliConfig): Promise<void> {
   }
 }
 
-// ─── Register ─────────────────────────────────────────────────────────────────
+// ─── Plugin object type ───────────────────────────────────────────────────────
 
-export async function register(ctx: RegisterContext): Promise<void> {
+export interface ILlmProviderPlugin {
+  providerId: string
+  profiles:   LlmProfileConfig[]
+  chat:       typeof chatCli
+  stream:     typeof streamCli
+}
+
+// ─── Register ─────────────────────────────────────────────────────────────────
+//
+// Subprocess-safe convention (v2):
+//   register() — no args — returns ILlmProviderPlugin synchronously.
+//   The subprocess worker (plugin-subprocess-worker.cjs) calls registerFn()
+//   and expects the returned object.
+//
+// Legacy / system-plugin convention (v1, bootstrap.ts only):
+//   register(ctx) — optional ctx — also calls ctx.registerLlmPlugin() if provided.
+//   bootstrap.ts passes ctx to inject the DB-backed registerLlmPlugin callback.
+//   `await register(ctx)` remains valid (await on a non-Promise resolves immediately).
+
+export function register(ctx?: RegisterContext): ILlmProviderPlugin {
   const config = loadCliConfig()
   setConfig(config)
 
-  // Store dispatchNotification on globalThis for use in the periodic revalidation interval
-  if (ctx.dispatchNotification) {
-    const dispatchFn = ctx.dispatchNotification
-    ;(globalThis as Record<string, unknown>)['__claudeCliDispatch'] = dispatchFn
+  // Store dispatchNotification on globalThis for periodic revalidation notifications
+  if (ctx?.dispatchNotification) {
+    ;(globalThis as Record<string, unknown>)['__claudeCliDispatch'] = ctx.dispatchNotification
   }
 
   // T108: ToS opt-in gate
@@ -250,32 +268,18 @@ export async function register(ctx: RegisterContext): Promise<void> {
       'complies with Anthropic Terms of Service.'
     console.warn(reason)
     markPluginNotConfigured()
-    ctx.registerLlmPlugin({
-      providerId: 'claude-cli',
-      profiles:   [],
-      chat:       chatCli as RegisterContext['registerLlmPlugin'] extends (p: { chat: infer C }) => void ? C : never,
-      stream:     streamCli as RegisterContext['registerLlmPlugin'] extends (p: { stream: infer S }) => void ? S : never,
-    })
-    return
+    const plugin: ILlmProviderPlugin = { providerId: 'claude-cli', profiles: [], chat: chatCli, stream: streamCli }
+    ctx?.registerLlmPlugin(plugin as never)
+    return plugin
   }
-
-  // Restore persisted rate-limit state from DB (T041)
-  await loadSnapshotFromDb()
 
   const token = process.env[config.oauthTokenEnv] ?? ''
   if (!token) {
     console.info(`[claude-cli] ${config.oauthTokenEnv} not set — plugin registered with 0 profiles.`)
     markPluginNotConfigured()
-    ctx.registerLlmPlugin({ providerId: 'claude-cli', profiles: [], chat: chatCli as never, stream: streamCli as never })
-    return
-  }
-
-  const validation = await validate(config)
-  if (!validation.ok) {
-    console.warn(`[claude-cli] Validation failed — plugin disabled: ${validation.reason}`)
-    markPluginDead(validation.reason ?? 'validation failed')
-    ctx.registerLlmPlugin({ providerId: 'claude-cli', profiles: [], chat: chatCli as never, stream: streamCli as never })
-    return
+    const plugin: ILlmProviderPlugin = { providerId: 'claude-cli', profiles: [], chat: chatCli, stream: streamCli }
+    ctx?.registerLlmPlugin(plugin as never)
+    return plugin
   }
 
   const profiles: LlmProfileConfig[] = [
@@ -283,61 +287,83 @@ export async function register(ctx: RegisterContext): Promise<void> {
     ...(config.enableOpus ? [OPUS_PROFILE] : []),
   ]
 
-  markPluginActive()
-  ctx.registerLlmPlugin({ providerId: 'claude-cli', profiles, chat: chatCli as never, stream: streamCli as never })
+  const plugin: ILlmProviderPlugin = { providerId: 'claude-cli', profiles, chat: chatCli, stream: streamCli }
 
-  console.info(`[claude-cli] Plugin active — ${profiles.length} profile(s): ${profiles.map(p => p.id).join(', ')}`)
+  // Register immediately with ctx (legacy system-plugin path)
+  ctx?.registerLlmPlugin(plugin as never)
 
-  // T100: Distributed semaphore (optional)
+  // Async init in background — non-blocking so subprocess bridge handshake completes fast.
+  // In subprocess mode: loadSnapshotFromDb and distributed semaphore fail gracefully (no DB).
+  // In system-plugin mode: DB is available via initWithDb(), both succeed.
   void (async () => {
-    try {
-      const { createDistributedSemaphoreIfEnabled } = await import('./distributed-semaphore.js')
-      const distSem = await createDistributedSemaphoreIfEnabled(config.maxConcurrent)
-      if (distSem) {
-        setActiveSemaphore(distSem)
-        console.info('[claude-cli] Distributed semaphore active.')
+    // T041: Restore persisted rate-limit state from DB
+    await loadSnapshotFromDb().catch(err => {
+      console.warn('[claude-cli] loadSnapshotFromDb skipped (no DB in subprocess):', err instanceof Error ? err.message : String(err))
+    })
+
+    const validation = await validate(config)
+    if (!validation.ok) {
+      console.warn(`[claude-cli] Validation failed — plugin disabled: ${validation.reason}`)
+      markPluginDead(validation.reason ?? 'validation failed')
+      return
+    }
+
+    markPluginActive()
+    console.info(`[claude-cli] Plugin active — ${profiles.length} profile(s): ${profiles.map(p => p.id).join(', ')}`)
+
+    // T100: Distributed semaphore (optional, requires DB — fails gracefully in subprocess)
+    void (async () => {
+      try {
+        const { createDistributedSemaphoreIfEnabled } = await import('./distributed-semaphore.js')
+        const distSem = await createDistributedSemaphoreIfEnabled(config.maxConcurrent)
+        if (distSem) {
+          setActiveSemaphore(distSem)
+          console.info('[claude-cli] Distributed semaphore active.')
+        }
+      } catch (err) {
+        console.warn('[claude-cli] Failed to initialize distributed semaphore (in-memory fallback):', err instanceof Error ? err.message : err)
       }
-    } catch (err) {
-      console.warn('[claude-cli] Failed to initialize distributed semaphore (in-memory fallback):', err instanceof Error ? err.message : err)
+    })()
+
+    // Async token ping
+    void pingAuth(config)
+
+    // T115: Periodic token re-validation
+    const intervalHours = config.tokenValidationIntervalHours
+    if (intervalHours > 0) {
+      const intervalMs = intervalHours * 3_600_000
+      const revalidate = async () => {
+        try {
+          const cfg    = loadCliConfig()
+          const result = await validate(cfg)
+          if (!result.ok) {
+            console.error(`[claude-cli] Periodic token re-validation FAILED: ${result.reason}`)
+            markPluginDead(result.reason ?? 'periodic validation failed')
+            try {
+              const dispatch = (globalThis as Record<string, unknown>)['__claudeCliDispatch'] as
+                ((e: { type: string; title: string; body: string }) => Promise<void>) | undefined
+              await dispatch?.({
+                type:  'claude_cli.token_expired',
+                title: 'Claude CLI: token validation failed',
+                body:  result.reason ?? 'Periodic token re-validation failed. Regenerate with: claude setup-token',
+              })
+            } catch { /* notification system may not be configured in subprocess */ }
+          } else {
+            console.info('[claude-cli] Periodic token re-validation OK.')
+          }
+        } catch (err) {
+          console.warn(`[claude-cli] Periodic re-validation threw: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+
+      const intervalKey = '__claudeCliRevalidateInterval'
+      if ((globalThis as Record<string, unknown>)[intervalKey]) {
+        clearInterval((globalThis as Record<string, unknown>)[intervalKey] as ReturnType<typeof setInterval>)
+      }
+      ;(globalThis as Record<string, unknown>)[intervalKey] = setInterval(revalidate, intervalMs)
+      console.info(`[claude-cli] Periodic re-validation scheduled every ${intervalHours}h.`)
     }
   })()
 
-  // Async token ping
-  void pingAuth(config)
-
-  // T115: Periodic token re-validation
-  const intervalHours = config.tokenValidationIntervalHours
-  if (intervalHours > 0) {
-    const intervalMs = intervalHours * 3_600_000
-    const revalidate = async () => {
-      try {
-        const cfg    = loadCliConfig()
-        const result = await validate(cfg)
-        if (!result.ok) {
-          console.error(`[claude-cli] Periodic token re-validation FAILED: ${result.reason}`)
-          markPluginDead(result.reason ?? 'periodic validation failed')
-          try {
-            const dispatch = (globalThis as Record<string, unknown>)['__claudeCliDispatch'] as
-              ((e: { type: string; title: string; body: string }) => Promise<void>) | undefined
-            await dispatch?.({
-              type:  'claude_cli.token_expired',
-              title: 'Claude CLI: token validation failed',
-              body:  result.reason ?? 'Periodic token re-validation failed. Regenerate with: claude setup-token',
-            })
-          } catch { /* notification system may not be configured */ }
-        } else {
-          console.info('[claude-cli] Periodic token re-validation OK.')
-        }
-      } catch (err) {
-        console.warn(`[claude-cli] Periodic re-validation threw: ${err instanceof Error ? err.message : String(err)}`)
-      }
-    }
-
-    const intervalKey = '__claudeCliRevalidateInterval'
-    if ((globalThis as Record<string, unknown>)[intervalKey]) {
-      clearInterval((globalThis as Record<string, unknown>)[intervalKey] as ReturnType<typeof setInterval>)
-    }
-    ;(globalThis as Record<string, unknown>)[intervalKey] = setInterval(revalidate, intervalMs)
-    console.info(`[claude-cli] Periodic re-validation scheduled every ${intervalHours}h.`)
-  }
+  return plugin
 }

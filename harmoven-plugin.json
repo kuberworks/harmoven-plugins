@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0",
+  "capability_type": "llm_provider_plugin",
+  "provider_type": "llm_provider",
+  "provider_id": "claude-cli",
+  "pack_id": "claude_cli_llm_provider",
+  "name": "Claude CLI LLM Provider",
+  "version": "1.0.0",
+  "author": "community",
+  "description": "Routes LLM calls through a Claude Pro/Max subscription via the Claude CLI OAuth token. Requires a valid Claude Max or Team subscription and the @anthropic-ai/claude-code CLI installed globally.",
+  "tags": ["llm-provider", "claude", "claude-cli", "anthropic", "subscription"],
+  "harmoven_min_version": "0.1.0",
+  "license": "MIT",
+  "content_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+}
