@@ -82,13 +82,7 @@ if [[ -t 0 ]]; then
   fi
 fi
 
-# ─── Remove plugin files ──────────────────────────────────────────────────────
-
-rm -rf "${PLUGIN_DIR}"
-echo ""
-echo "  ✓ Plugin files removed: ${PLUGIN_DIR}"
-
-# ─── (Optional) Drop DB tables ───────────────────────────────────────────────
+# ─── (Optional) Drop DB tables — runs BEFORE removing plugin files ───────────
 
 if [[ "${DROP_DATA}" == true ]]; then
   # Resolve DATABASE_URL — try env, then .env.local
@@ -103,23 +97,30 @@ if [[ "${DROP_DATA}" == true ]]; then
     exit 1
   fi
 
-  if ! command -v psql &>/dev/null; then
-    echo ""
-    echo "  ✗ Cannot drop tables: psql is not installed." >&2
-    echo "    Run the following SQL manually:" >&2
-    echo '      DROP TABLE IF EXISTS "plugin_claude_cli_semaphore_slot";' >&2
-    echo '      DROP TABLE IF EXISTS "plugin_claude_cli_rate_limit_snapshot";' >&2
+  # Use the SQL file bundled with the plugin (before files are removed).
+  PLUGIN_SQL="${PLUGIN_DIR}/sql/drop-legacy-tables.sql"
+  if [[ ! -f "${PLUGIN_SQL}" ]]; then
+    echo "  ✗ Cannot drop tables: ${PLUGIN_SQL} not found." >&2
     exit 1
   fi
 
-  psql "${DATABASE_URL}" <<'SQL'
-    DROP INDEX  IF EXISTS "plugin_claude_cli_semaphore_slot_held_by_idx";
-    DROP TABLE  IF EXISTS "plugin_claude_cli_semaphore_slot";
-    DROP TABLE  IF EXISTS "plugin_claude_cli_rate_limit_snapshot";
-SQL
+  if ! command -v psql &>/dev/null; then
+    echo ""
+    echo "  ✗ Cannot drop tables: psql is not installed." >&2
+    echo "    Run the following manually when psql is available:" >&2
+    echo "      psql \"\$DATABASE_URL\" -f ${PLUGIN_SQL}" >&2
+    exit 1
+  fi
 
+  psql "${DATABASE_URL}" -f "${PLUGIN_SQL}"
   echo "  ✓ Plugin DB tables dropped."
 fi
+
+# ─── Remove plugin files ──────────────────────────────────────────────────────
+
+rm -rf "${PLUGIN_DIR}"
+echo ""
+echo "  ✓ Plugin files removed: ${PLUGIN_DIR}"
 
 # ─── Done ─────────────────────────────────────────────────────────────────────
 
